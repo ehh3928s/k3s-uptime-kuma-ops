@@ -1,0 +1,144 @@
+# =============================================================================
+# 资源命名
+# =============================================================================
+# fullnameOverride 固定为 uptime-kuma，使渲染出的 Deployment / Service 名字
+# 与「已经用 kubectl apply 创建的对象」完全一致。
+# 若改名，helm install 会认为是新对象（多出一套副本），而不是接管旧对象。
+nameOverride: uptime-kuma
+fullnameOverride: uptime-kuma
+
+# Pod 选择器标签。必须与已有 Deployment 的 spec.selector.matchLabels 一致：
+# Deployment 的 selector 字段不可变，改它只能删掉重建。
+appLabel: uptime-kuma
+
+replicaCount: 1
+
+# =============================================================================
+# 镜像
+# =============================================================================
+image:
+  repository: louislam/uptime-kuma
+  # 已固定到具体版本。浮动 tag "2" 有两个问题：
+  #   1) 节点重启或镜像被 GC 后重拉，可能拿到未验证的新小版本；
+  #   2) values 里写的还是 "2"，事后看不出镜像何时变过。
+  # 升级流程：先在 containerd 给新版本镜像打好 tag（避免 Pod 重建时走外网慢拉），
+  # 再改这里并 helm upgrade。
+  tag: "2.5.8"
+  pullPolicy: IfNotPresent
+
+# =============================================================================
+# 服务暴露
+# =============================================================================
+service:
+  type: NodePort
+  port: 3001
+  nodePort: 30001
+
+# =============================================================================
+# 持久化
+# =============================================================================
+persistence:
+  enabled: true
+  # claim 名写死，不跟随 fullname，便于接管已有 PVC
+  name: uptime-kuma-data
+  # 留空 = 由本 Chart 渲染 PVC；填已有 claim 名 = 只引用、不渲染
+  existingClaim: ""
+  storageClass: local-path
+  accessMode: ReadWriteOnce
+  size: 2Gi
+  # 给 PVC 打 helm.sh/resource-policy: keep，helm uninstall 时不删数据卷
+  keepOnUninstall: true
+
+# =============================================================================
+# 资源限制
+# =============================================================================
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 384Mi
+
+# =============================================================================
+# 健康探针
+# =============================================================================
+probes:
+  readiness:
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    timeoutSeconds: 5
+  liveness:
+    initialDelaySeconds: 90
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# =============================================================================
+# 安全上下文
+# =============================================================================
+# 默认全部关闭：首次 helm install 追求「渲染结果与线上现状零差异」，
+# 任何 spec 变更都会触发 Pod 重建。接管确认无误后再逐个打开做加固。
+podSecurityContext:
+  enabled: false
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+containerSecurityContext:
+  enabled: false
+  allowPrivilegeEscalation: false
+  dropAllCapabilities: true
+
+# 追加环境变量。默认留空——线上 Deployment 目前没有 env 段，
+# 凭空加一条也会让 Pod 重建，接管阶段保持 spec 零差异。
+# 需要时例如：
+#   extraEnv:
+#     - name: TZ
+#       value: Asia/Shanghai
+extraEnv: []
+
+# =============================================================================
+# 定时备份
+# =============================================================================
+backup:
+  enabled: true
+  schedule: "0 3 * * *"
+  timezone: Asia/Shanghai
+  # 备份保留天数，对应 find -mtime +N
+  keepDays: 7
+  # 备份落盘位置（节点宿主机目录，需 chown 1000:1000）
+  hostPath: /var/backups/uptime-kuma
+
+  image:
+    repository: louislam/uptime-kuma
+    # 与主容器保持一致，复用同一份镜像层，不额外占磁盘
+    tag: "2.5.8"
+
+  # 必须固定 uid 1000：与 PVC 内文件属主一致，
+  # 否则备份文件变 root 属主，且 root 打开 WAL 库会把 -wal/-shm 改成 root，
+  # 导致 Deployment 的 Pod 重启后 "readonly database"。
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  activeDeadlineSeconds: 600
+  backoffLimit: 2
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+# =============================================================================
+# 全局
+# =============================================================================
+# 覆盖 Pod 时区，保证容器内 date 与宿主/调度器一致
+timezone: Asia/Shanghai

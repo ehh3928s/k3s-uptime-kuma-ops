@@ -1,0 +1,112 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: uptime-kuma-backup
+  namespace: monitoring
+  labels:
+    app: uptime-kuma
+    role: backup
+spec:
+  # 每天凌晨 3 点执行。调度时区由 k3s 控制器（宿主机 Asia/Shanghai）决定，
+  # 容器内另用 TZ 环境变量保证 date 输出同为北京时间，避免文件名与日志时间错位。
+  schedule: "0 3 * * *"
+  # 同一时刻只允许一个备份任务，防止并发写同一目录
+  concurrencyPolicy: Forbid
+  # 错过调度时间（如节点宕机）后 10 分钟内仍尝试补跑，超时则放弃
+  startingDeadlineSeconds: 600
+  # 保留成功/失败任务记录数量，避免 Job 对象无限堆积
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # 失败最多重试 2 次
+      backoffLimit: 2
+      # 任务超过 10 分钟未完成则终止，防止挂死占资源
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          restartPolicy: OnFailure
+          # 显式以 uid/gid 1000 运行，与 PVC 内文件属主、宿主机备份目录属主一致。
+          # 镜像默认是 root；不指定的话备份文件会变成 root:root，且以 root
+          # 打开 SQLite 库存在把 -wal/-shm 属主改成 root 的风险，一旦发生，
+          # Deployment 的 Pod 重启后将无法写入数据库（readonly database）。
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            fsGroup: 1000
+          containers:
+            - name: backup
+              # 复用已有镜像，内部自带 sqlite3 3.40.1（无需额外拉取）
+              image: louislam/uptime-kuma:2
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: TZ
+                  value: Asia/Shanghai
+              # 容器级加固：禁止提权、丢弃全部 Linux capabilities。
+              # 备份只做文件读写，不需要任何特权。
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  TS=$(date +%Y%m%d-%H%M%S)
+                  DEST="/backup/kuma-${TS}.db"
+                  SRC="/app/data/kuma.db"
+
+                  echo "[1/4] source: ${SRC}"
+                  ls -lh "${SRC}"
+                  echo "     run at: $(date '+%Y-%m-%d %H:%M:%S %Z')  uid=$(id -u)"
+
+                  echo "[2/4] online backup -> ${DEST}"
+                  # .backup 是 SQLite 官方在线备份命令，保证读取到一致快照，
+                  # 不会读到写入中途的半成品。不能改用 cp。
+                  sqlite3 "${SRC}" ".backup '${DEST}'"
+
+                  echo "[3/4] integrity check"
+                  RESULT=$(sqlite3 "${DEST}" "PRAGMA integrity_check;")
+                  echo "     integrity_check => ${RESULT}"
+                  if [ "${RESULT}" != "ok" ]; then
+                    echo "FATAL: backup integrity check failed, removing file"
+                    rm -f "${DEST}"
+                    exit 1
+                  fi
+                  ls -lh "${DEST}"
+
+                  echo "[4/4] rotate: keep last 7 days"
+                  find /backup -maxdepth 1 -name 'kuma-*.db' -type f -mtime +7 -print -delete
+                  echo "     remaining backups:"
+                  ls -lh /backup | tail -n 10
+
+                  echo "backup done: ${DEST}"
+              volumeMounts:
+                # 源数据库所在 PVC。必须读写挂载：SQLite 以 WAL 模式打开库时
+                # 需要可写的 -shm 索引文件，只读挂载会报 "readonly database"。
+                - name: data
+                  mountPath: /app/data
+                # 备份输出目录，落在节点宿主机上，方便查看与下载
+                - name: backup
+                  mountPath: /backup
+              resources:
+                requests:
+                  memory: "32Mi"
+                  cpu: "20m"
+                limits:
+                  memory: "128Mi"
+                  cpu: "200m"
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: uptime-kuma-data
+            - name: backup
+              hostPath:
+                # 该目录需提前在节点上创建并 chown 1000:1000
+                # 因为容器内以 uid 1000 身份运行
+                path: /var/backups/uptime-kuma
+                type: DirectoryOrCreate

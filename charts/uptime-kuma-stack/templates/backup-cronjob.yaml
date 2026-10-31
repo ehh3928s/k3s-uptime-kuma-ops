@@ -1,0 +1,106 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "uk.backupName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "uk.labels" . | nindent 4 }}
+    role: backup
+spec:
+  # 调度时区由 k3s 控制器（宿主机 Asia/Shanghai）决定，
+  # 容器内另用 TZ 环境变量保证 date 输出同为北京时间，避免文件名与日志时间错位。
+  schedule: {{ .Values.backup.schedule | quote }}
+  # 同一时刻只允许一个备份任务，防止并发写同一目录
+  concurrencyPolicy: {{ .Values.backup.concurrencyPolicy }}
+  # 错过调度时间（如节点宕机）后 10 分钟内仍尝试补跑，超时则放弃
+  startingDeadlineSeconds: {{ .Values.backup.startingDeadlineSeconds }}
+  # 保留成功/失败任务记录数量，避免 Job 对象无限堆积
+  successfulJobsHistoryLimit: {{ .Values.backup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.backup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.backup.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.backup.activeDeadlineSeconds }}
+      template:
+        spec:
+          restartPolicy: OnFailure
+          # 显式以 uid/gid 运行，与 PVC 内文件属主、宿主机备份目录属主一致。
+          # 镜像默认是 root；不指定的话备份文件会变成 root:root，且以 root
+          # 打开 SQLite 库存在把 -wal/-shm 属主改成 root 的风险，一旦发生，
+          # Deployment 的 Pod 重启后将无法写入数据库（readonly database）。
+          securityContext:
+            runAsUser: {{ .Values.backup.runAsUser }}
+            runAsGroup: {{ .Values.backup.runAsGroup }}
+            runAsNonRoot: true
+            fsGroup: {{ .Values.backup.fsGroup }}
+          containers:
+            - name: backup
+              image: "{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              env:
+                - name: TZ
+                  value: {{ .Values.backup.timezone | quote }}
+              # 容器级加固：禁止提权、丢弃全部 Linux capabilities。
+              # 备份只做文件读写，不需要任何特权。
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+
+                  TS=$(date +%Y%m%d-%H%M%S)
+                  DEST="/backup/kuma-${TS}.db"
+                  SRC="/app/data/kuma.db"
+
+                  echo "[1/4] source: ${SRC}"
+                  ls -lh "${SRC}"
+                  echo "     run at: $(date '+%Y-%m-%d %H:%M:%S %Z')  uid=$(id -u)"
+
+                  echo "[2/4] online backup -> ${DEST}"
+                  # .backup 是 SQLite 官方在线备份命令，保证读取到一致快照，
+                  # 不会读到写入中途的半成品。不能改用 cp。
+                  sqlite3 "${SRC}" ".backup '${DEST}'"
+
+                  echo "[3/4] integrity check"
+                  RESULT=$(sqlite3 "${DEST}" "PRAGMA integrity_check;")
+                  echo "     integrity_check => ${RESULT}"
+                  if [ "${RESULT}" != "ok" ]; then
+                    echo "FATAL: backup integrity check failed, removing file"
+                    rm -f "${DEST}"
+                    exit 1
+                  fi
+                  ls -lh "${DEST}"
+
+                  echo "[4/4] rotate: keep last {{ .Values.backup.keepDays }} days"
+                  find /backup -maxdepth 1 -name 'kuma-*.db' -type f -mtime +{{ .Values.backup.keepDays }} -print -delete
+                  echo "     remaining backups:"
+                  ls -lh /backup | tail -n 10
+
+                  echo "backup done: ${DEST}"
+              volumeMounts:
+                # 源数据库所在 PVC。必须读写挂载：SQLite 以 WAL 模式打开库时
+                # 需要可写的 -shm 索引文件，只读挂载会报 "readonly database"。
+                - name: data
+                  mountPath: /app/data
+                # 备份输出目录，落在节点宿主机上，方便查看与下载
+                - name: backup
+                  mountPath: /backup
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: {{ include "uk.pvcName" . }}
+            - name: backup
+              hostPath:
+                # 该目录需提前在节点上创建并 chown 1000:1000
+                # 因为容器内以 uid 1000 身份运行
+                path: {{ .Values.backup.hostPath }}
+                type: DirectoryOrCreate
+{{- end }}

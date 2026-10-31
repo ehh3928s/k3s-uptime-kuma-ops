@@ -1,0 +1,16 @@
+apiVersion: v2
+name: uptime-kuma-stack
+description: |
+  Uptime Kuma on k3s (SQLite on local-path PVC) with a daily sqlite3 .backup
+  CronJob. Designed to adopt pre-existing kubectl-created objects without
+  recreating the PersistentVolumeClaim.
+type: application
+version: 1.1.0
+appVersion: "2.5.8"
+keywords:
+  - uptime-kuma
+  - monitoring
+  - k3s
+  - sqlite
+maintainers:
+  - name: mikudayo
